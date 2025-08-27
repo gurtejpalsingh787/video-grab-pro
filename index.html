@@ -1,0 +1,370 @@
+// -------------------------------------------------------------
+// FILE: settings.gradle
+// -------------------------------------------------------------
+rootProject.name = "VideoDownloader"
+include(":app")
+
+// -------------------------------------------------------------
+// FILE: build.gradle  (project-level)
+// -------------------------------------------------------------
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.1.1"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+// -------------------------------------------------------------
+// FILE: app/build.gradle  (module-level)
+// -------------------------------------------------------------
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.yourapp.downloader'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.yourapp.downloader"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    kotlinOptions { jvmTarget = "11" }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+}
+
+// -------------------------------------------------------------
+// FILE: app/src/main/AndroidManifest.xml
+// -------------------------------------------------------------
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.yourapp.downloader">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- For older Android versions we request WRITE_EXTERNAL_STORAGE at runtime -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+
+    <application
+        android:allowBackup="true"
+        android:label="Video Downloader"
+        android:supportsRtl="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+// -------------------------------------------------------------
+// FILE: app/src/main/res/layout/activity_main.xml
+// -------------------------------------------------------------
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <WebView
+        android:id="@+id/webView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</FrameLayout>
+
+// -------------------------------------------------------------
+// FILE: app/src/main/java/com/yourapp/downloader/MainActivity.kt
+// -------------------------------------------------------------
+package com.yourapp.downloader
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ContentValues
+import android.media.MediaScannerConnection
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.webkit.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.*
+import java.io.BufferedInputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
+class MainActivity : AppCompatActivity() {
+    private lateinit var webView: WebView
+    private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val requestStoragePermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        toast(if (granted) "Storage permission granted" else "Storage permission denied")
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        webView = findViewById(R.id.webView)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.allowFileAccess = true
+        webView.webViewClient = WebViewClient()
+        webView.webChromeClient = WebChromeClient()
+
+        // ====== Replace this with your GitHub Pages / live site URL ======
+        webView.loadUrl("https://YOUR-WEBSITE.example/")
+        // =================================================================
+
+        // Add JS interface so website can call Android.downloadFile(url, filename)
+        webView.addJavascriptInterface(JSBridge(this), "Android")
+
+        // Handle normal link/file downloads clicked inside WebView
+        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            startDownload(url, fileName, mimeType ?: "video/mp4")
+        }
+
+        // Request storage permission on older devices (Android < Q)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+    }
+
+    private fun startDownload(url: String, fileName: String, mime: String) {
+        ioScope.launch { downloadAndSave(url, fileName, mime) }
+    }
+
+    // JS Bridge class - website calls window.Android.downloadFile(url, filename)
+    class JSBridge(private val activity: MainActivity) {
+        @JavascriptInterface
+        fun downloadFile(url: String, filename: String?) {
+            val name = if (filename.isNullOrBlank()) {
+                URLUtil.guessFileName(url, null, null)
+            } else filename
+            activity.startDownload(url, name, "video/mp4")
+        }
+    }
+
+    private suspend fun downloadAndSave(fileUrl: String, displayName: String, mime: String) {
+        var conn: HttpURLConnection? = null
+        var outUri: Uri? = null
+        try {
+            val url = URL(fileUrl)
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15000
+                readTimeout = 30000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "Mozilla/5.0")
+                connect()
+            }
+            if (conn.responseCode !in 200..299) throw Exception("HTTP ${conn.responseCode}")
+
+            val input = BufferedInputStream(conn.inputStream)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Use MediaStore (scoped storage) -> DCIM/YourApp
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                    put(MediaStore.Video.Media.MIME_TYPE, mime)
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/YourApp")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                outUri = contentResolver.insert(collection, values)
+                outUri?.let { uri ->
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        val buffer = ByteArray(8 * 1024)
+                        var bytes: Int
+                        while (input.read(buffer).also { bytes = it } != -1) {
+                            out.write(buffer, 0, bytes)
+                        }
+                        out.flush()
+                    } ?: throw Exception("Cannot open output stream")
+                    // mark not pending
+                    val cv = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                    contentResolver.update(uri, cv, null, null)
+                } ?: throw Exception("Failed to create MediaStore entry")
+            } else {
+                // Legacy devices: write file to DCIM/YourApp and scan
+                val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                val dir = File(dcim, "YourApp")
+                if (!dir.exists()) dir.mkdirs()
+                val outFile = File(dir, displayName)
+                FileOutputStream(outFile).use { out ->
+                    val buffer = ByteArray(8 * 1024)
+                    var bytes: Int
+                    while (input.read(buffer).also { bytes = it } != -1) {
+                        out.write(buffer, 0, bytes)
+                    }
+                    out.flush()
+                }
+                MediaScannerConnection.scanFile(this, arrayOf(outFile.absolutePath), arrayOf(mime), null)
+            }
+
+            withContext(Dispatchers.Main) {
+                toast("Saved: $displayName")
+            }
+        } catch (e: Exception) {
+            outUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
+            withContext(Dispatchers.Main) {
+                toast("Download failed: ${e.message}")
+            }
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun toast(msg: String) {
+        runOnUiThread { android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show() }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ioScope.cancel()
+    }
+}
+
+// -------------------------------------------------------------
+// FILE: app/src/main/assets/index.html  (optional local fallback page)
+// -------------------------------------------------------------
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Video Downloader</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1b2b;--accent:#4f46e5;--muted:#9aa6b2;--white:#e6eef8}
+    *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    body{margin:0;background:linear-gradient(180deg,#071026 0,#0f1724 100%);color:var(--white);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px}
+    .card{width:100%;max-width:860px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:28px;box-shadow:0 6px 30px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.03)}
+    h1{margin:0 0 8px;font-size:20px}
+    p.lead{margin:0 0 18px;color:var(--muted)}
+    .row{display:flex;gap:12px}
+    input[type="text"]{flex:1;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:var(--white);outline:none}
+    button{padding:10px 16px;border-radius:10px;border:0;background:linear-gradient(90deg,var(--accent),#22c55e);color:#fff;cursor:pointer;font-weight:600}
+    .note{margin-top:14px;color:var(--muted);font-size:13px}
+    .list{margin-top:18px}
+    .item{padding:10px;border-radius:8px;background:rgba(255,255,255,0.02);display:flex;justify-content:space-between;align-items:center;margin-top:10px}
+    .small{font-size:13px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Video Downloader</h1>
+    <p class="lead">Apni video URL yahan paste karein. Agar aap Android app se use kar rahe hain, to app background me video DCIM/YourApp me save kar dega.</p>
+
+    <div class="row">
+      <input id="videoUrl" type="text" placeholder="https://example.com/path/to/video.mp4" />
+      <button id="downloadBtn">Download</button>
+    </div>
+
+    <div class="note">Tip: Agar aap app me ye page open karenge, app aapke liye direct gallery me video save karegi. Browser me ye file browser ke downloads me jayegi.</div>
+
+    <div class="list" id="history"></div>
+  </div>
+
+  <script>
+    const btn = document.getElementById('downloadBtn')
+    const urlInput = document.getElementById('videoUrl')
+    const historyEl = document.getElementById('history')
+
+    function addHistory(text){
+      const div = document.createElement('div')
+      div.className = 'item'
+      div.innerHTML = `<div><div>${text}</div><div class="small">Started</div></div><div class="small">—</div>`
+      historyEl.prepend(div)
+    }
+
+    function startDownload(url, filename) {
+      if (!url) return alert('Please enter a URL')
+
+      // If inside the Android WebView with JS bridge available
+      if (window.Android && typeof window.Android.downloadFile === 'function') {
+        try {
+          window.Android.downloadFile(url, filename || '')
+          addHistory('Downloading (app): ' + (filename || url))
+          return
+        } catch(e) {
+          console.error('Android bridge failed', e)
+        }
+      }
+
+      // Fallback for normal browsers: create anchor and click
+      const a = document.createElement('a')
+      a.href = url
+      if (filename) a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      addHistory('Downloading (browser): ' + (filename || url))
+    }
+
+    btn.addEventListener('click', () => {
+      const url = urlInput.value.trim()
+      const filename = url.split('/').pop().split('?')[0]
+      startDownload(url, filename)
+    })
+
+    urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') btn.click() })
+  </script>
+</body>
+</html>
+
+// -------------------------------------------------------------
+// FILE: website snippet (to paste into your website near download button)
+// -------------------------------------------------------------
+<!--
+<button onclick="startDownload('https://example.com/path/to/video.mp4', 'myvideo.mp4')">Download to App</button>
+
+<script>
+function startDownload(url, filename) {
+  if (window.Android && typeof window.Android.downloadFile === 'function') {
+    try {
+      window.Android.downloadFile(url, filename || '');
+      return;
+    } catch(e) { console.error('Android bridge failed', e); }
+  }
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+</script>
+-->
+// -------------------------------------------------------------
